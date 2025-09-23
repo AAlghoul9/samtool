@@ -1,0 +1,107 @@
+# SAM2 Segmentation — Streamlit App
+
+Interactive demo for automatic image segmentation using the Hugging Face transformers mask-generation pipeline with the model `facebook/sam2-hiera-large`.
+
+The app lets you:
+- Upload an image
+- Tweak SAM2 Automatic Mask Generation (AMG) knobs
+- Run segmentation on CPU, Apple Silicon (MPS), or CUDA GPU
+- Preview overlays and export masks as a ZIP
+
+---
+
+## Quickstart
+
+```bash
+# 1) Create and activate a virtual environment (Python 3.12 recommended)
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+# 2) Install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 3) Run the Streamlit app
+streamlit run app.py
+```
+
+Then open the URL that Streamlit prints (usually `http://localhost:8501`).
+
+---
+
+## Requirements
+- Python 3.12 (recommended). Other versions may work but are not guaranteed by the pinned wheels.
+- Internet connection on first run to download the model weights and processor from Hugging Face.
+- Disk space for model cache (several GB). Downloaded to `~/.cache/huggingface` by default.
+
+### Hardware acceleration
+- Apple Silicon (MPS): Supported if your macOS/PyTorch supports MPS. The app will auto-detect and use it when “Prefer hardware acceleration” is checked.
+- NVIDIA CUDA: Supported if you install a CUDA-enabled PyTorch build (see below). The default `requirements.txt` pins CPU wheels.
+- CPU-only: Works everywhere; slower.
+
+---
+
+## CUDA users (optional)
+If you have an NVIDIA GPU and want CUDA acceleration, install PyTorch with CUDA per the official instructions instead of the CPU wheels in `requirements.txt`.
+
+Example for CUDA 12.1 wheels:
+```bash
+# Activate your venv first
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Then install the rest of the deps (skip torch/torchvision duplicates)
+pip install -r requirements.txt --no-deps
+pip install "transformers==4.56.1" "streamlit==1.49.1" "Pillow>=10.0.0" "numpy<2.0" "matplotlib>=3.8"
+```
+Adjust CUDA version and commands based on your environment: see [PyTorch](https://pytorch.org).
+
+---
+
+## Usage
+1. Start the app: `streamlit run app.py`.
+2. Upload a `.jpg`, `.jpeg`, `.png`, or `.bmp` image.
+3. Optionally enable “Prefer hardware acceleration (CUDA/MPS)” in the sidebar.
+4. Tweak AMG knobs (e.g., `points_per_side`, `pred_iou_thresh`, `crops_n_layers`).
+5. Click “Run segmentation”.
+6. Inspect:
+   - Overlay (image + colorful masks)
+   - Masks-only grid (optional)
+   - Combined masks image
+7. Download a ZIP containing individual mask PNGs (and optionally overlay/combined images).
+
+---
+
+## Notes
+- First run downloads the model/processor from the Hugging Face Hub and may take a while.
+- Cache location can be changed via env var `HF_HOME` if desired.
+- Large images may be preprocessed (resize/pad) automatically if the pipeline rejects parameters due to memory/shape constraints.
+
+---
+
+## Troubleshooting
+- Slow or no GPU acceleration:
+  - Apple Silicon: Ensure macOS supports MPS and you’re on a recent PyTorch. The app will detect and show “Apple Silicon GPU (mps)” in the sidebar.
+  - NVIDIA: Ensure a CUDA-enabled PyTorch is installed (see CUDA users section) and correct drivers are present.
+- Out-of-memory or shape errors:
+  - Reduce `points_per_side` / `points_per_batch`.
+  - Try enabling the built-in preprocessing by leaving defaults and re-running.
+- Model download issues:
+  - Check internet connectivity and available disk space.
+  - Optional: set `HF_HOME` to a drive with more space, e.g., `export HF_HOME=/path/with/space`.
+- Import/version conflicts:
+  - Use a fresh virtual environment with Python 3.12 and reinstall.
+
+---
+
+## Project layout
+```
+.
+├── app.py            # Streamlit app
+├── requirements.txt  # Pinned dependencies
+└── README.md         # This file
+```
+
+---
+
+## License
+This repository is for demonstration purposes. Review the licenses of third-party models and libraries (PyTorch, transformers, Streamlit, SAM2 checkpoints) before commercial use.

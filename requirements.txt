@@ -1,0 +1,9 @@
+streamlit==1.49.1
+transformers==4.56.1
+# Use PyTorch versions with macOS CPU wheels for Python 3.12
+torch==2.2.2
+torchvision==0.17.2
+Pillow>=10.0.0
+numpy<2.0
+matplotlib>=3.8
+
