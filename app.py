@@ -45,10 +45,11 @@ def resize_and_pad_to_square(img: Image.Image, target_side: int = 1024) -> Image
 
 # ---- Helper: load HF pipeline (cached) ----
 @st.cache_resource
-def load_sam_pipeline(device):
+def load_sam_pipeline(device, model_id):
     """
     Load Hugging Face mask-generation pipeline for SAM2.
     device: 0 for GPU (cuda:0), -1 for CPU
+    model_id: HF model id to load
     """
     from transformers import pipeline
     # Prefer slow image processor to avoid issues in fast path on some envs
@@ -56,16 +57,16 @@ def load_sam_pipeline(device):
     try:
         from transformers import AutoImageProcessor
         try:
-            processor = AutoImageProcessor.from_pretrained("facebook/sam2-hiera-large", use_fast=False)
+            processor = AutoImageProcessor.from_pretrained(model_id, use_fast=False)
         except TypeError:
-            processor = AutoImageProcessor.from_pretrained("facebook/sam2-hiera-large")
+            processor = AutoImageProcessor.from_pretrained(model_id)
     except Exception:
         pass
 
-    # model name used in examples: facebook/sam2-hiera-large or facebook/sam2.1-hiera-large
+    # model name examples: facebook/sam2-hiera-large or facebook/sam2.1-hiera-large
     return pipeline(
         "mask-generation",
-        model="facebook/sam2-hiera-large",
+        model=model_id,
         device=device,
         image_processor=processor,
     )
@@ -138,12 +139,40 @@ st.markdown(
 
 # Sidebar: runtime & model
 st.sidebar.header("Runtime and model")
-st.sidebar.info("Running on CPU only")
+
+# Decide device: CUDA if available, else CPU. Allow override via SAM_DEVICE env (cpu|cuda).
+device_env = os.getenv("SAM_DEVICE", "").lower()
 device_selected = -1
+device_label = "CPU"
+
+try:
+    if device_env == "cuda" and hasattr(torch, "cuda") and torch.cuda.is_available():
+        device_selected = 0
+        device_label = "CUDA:0"
+    elif device_env == "cpu":
+        device_selected = -1
+        device_label = "CPU"
+    else:
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            device_selected = 0
+            device_label = "CUDA:0"
+        else:
+            device_selected = -1
+            device_label = "CPU"
+except Exception:
+    device_selected = -1
+    device_label = "CPU"
+
+st.sidebar.info(f"Device: {device_label}")
+
+# Model selection via env var (optional)
+default_model_id = "facebook/sam2-hiera-large"
+model_id = os.getenv("SAM_MODEL_ID", default_model_id)
+st.sidebar.caption(f"Model: {model_id}")
 
 # Load model (cached)
 with st.spinner("Loading SAM2 pipeline (this may take a dozen seconds)..."):
-    pipe = load_sam_pipeline(device=device_selected)
+    pipe = load_sam_pipeline(device=device_selected, model_id=model_id)
 
 # Sidebar: AMG knobs UI
 st.sidebar.header("Automatic mask generation settings")
@@ -218,8 +247,8 @@ st.image(image_np_uint8, width="stretch")
 
 # Run button
 if st.button("Run segmentation"):
-    CPU_MAX_PPB = 64
-    ppb_clamped = CPU_MAX_PPB
+    PPB_LIMIT = 64 if device_selected == -1 else 128
+    ppb_clamped = PPB_LIMIT
 
     params = {
         # we'll try to pass these names — HF pipeline expects many of them (see docs)

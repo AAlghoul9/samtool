@@ -29,6 +29,21 @@ Then open the URL that Streamlit prints (usually `http://localhost:8501`).
 
 ---
 
+## Deploy to Streamlit Community Cloud
+
+1. Push this repo to GitHub.
+2. On Streamlit Community Cloud, create a new app pointing to `app.py`.
+3. No special hardware settings are required. Streamlit Cloud does not provide GPUs; the app will run on CPU and auto-detect devices if available.
+4. Ensure dependencies are pinned in `requirements.txt` (already provided). First run will download the model to the ephemeral cache.
+
+Optional configuration via environment variables:
+- `SAM_MODEL_ID` (default `facebook/sam2-hiera-large`): alternate model id
+- `SAM_DEVICE` (`cpu` or `cuda`): force device selection; by default the app auto-detects
+
+If you hit memory/time limits, reduce `points_per_side` and keep defaults for `crops_n_layers`.
+
+---
+
 ## Requirements
 - Python 3.12 (recommended). Other versions may work but are not guaranteed by the pinned wheels.
 - Internet connection on first run to download the model weights and processor from Hugging Face.
@@ -60,7 +75,7 @@ Adjust CUDA version and commands based on your environment: see [PyTorch](https:
 ## Usage
 1. Start the app: `streamlit run app.py`.
 2. Upload a `.jpg`, `.jpeg`, `.png`, or `.bmp` image.
-3. Optionally enable “Prefer hardware acceleration (CUDA/MPS)” in the sidebar.
+3. The app auto-detects available acceleration (CUDA/MPS) and falls back to CPU.
 4. Tweak AMG knobs (e.g., `points_per_side`, `pred_iou_thresh`, `crops_n_layers`).
 5. Click “Run segmentation”.
 6. Inspect:
@@ -80,7 +95,7 @@ Adjust CUDA version and commands based on your environment: see [PyTorch](https:
 
 ## Troubleshooting
 - Slow or no GPU acceleration:
-  - Apple Silicon: Ensure macOS supports MPS and you’re on a recent PyTorch. The app will detect and show “Apple Silicon GPU (mps)” in the sidebar.
+  - Apple Silicon: Ensure macOS supports MPS and you’re on a recent PyTorch. The app will detect and use MPS automatically.
   - NVIDIA: Ensure a CUDA-enabled PyTorch is installed (see CUDA users section) and correct drivers are present.
 - Out-of-memory or shape errors:
   - Reduce `points_per_side` / `points_per_batch`.
