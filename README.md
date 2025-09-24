@@ -13,13 +13,17 @@ The app lets you:
 ## Quickstart
 
 ```bash
-# 1) Create and activate a virtual environment (Python 3.12 recommended)
+# 1) Create and activate a virtual environment (Python 3.12 REQUIRED)
+python3.12 --version   # should print Python 3.12.x
 python3.12 -m venv .venv
 source .venv/bin/activate
 
 # 2) Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# 2b) Install PyTorch CPU wheels (required)
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
 
 # 3) Run the Streamlit app
 streamlit run app.py
@@ -45,7 +49,7 @@ If you hit memory/time limits, reduce `points_per_side` and keep defaults for `c
 ---
 
 ## Requirements
-- Python 3.12 (recommended). Other versions may work but are not guaranteed by the pinned wheels.
+- Python 3.12 (required). The pinned PyTorch/torchvision wheels do not support Python 3.13.
 - Internet connection on first run to download the model weights and processor from Hugging Face.
 - Disk space for model cache (several GB). Downloaded to `~/.cache/huggingface` by default.
 
@@ -53,6 +57,44 @@ If you hit memory/time limits, reduce `points_per_side` and keep defaults for `c
 - Apple Silicon (MPS): Supported if your macOS/PyTorch supports MPS. The app will auto-detect and use it when “Prefer hardware acceleration” is checked.
 - NVIDIA CUDA: Supported if you install a CUDA-enabled PyTorch build (see below). The default `requirements.txt` pins CPU wheels.
 - CPU-only: Works everywhere; slower.
+
+---
+
+## Python version and setup
+
+- macOS (Homebrew):
+  ```bash
+  brew install python@3.12
+  python3.12 --version   # verify 3.12.x
+  python3.12 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  ```
+
+- macOS/Linux (pyenv):
+  ```bash
+  # install pyenv per docs, then
+  pyenv install 3.12.7
+  pyenv local 3.12.7
+  python -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  ```
+
+- Windows (PowerShell):
+  ```powershell
+  py -3.12 -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+  pip install -r requirements.txt
+  ```
+
+Why 3.12? If you use Python 3.13 you will see errors like:
+
+```
+ERROR: No matching distribution found for torch==2.2.2
+```
+
+Switch to Python 3.12 to use the pinned wheels.
 
 ---
 
@@ -77,12 +119,29 @@ Adjust CUDA version and commands based on your environment: see [PyTorch](https:
 2. Upload a `.jpg`, `.jpeg`, `.png`, or `.bmp` image.
 3. The app auto-detects available acceleration (CUDA/MPS) and falls back to CPU.
 4. Tweak AMG knobs (e.g., `points_per_side`, `pred_iou_thresh`, `crops_n_layers`).
-5. Click “Run segmentation”.
-6. Inspect:
+5. Choose Embedding options in the sidebar (optional):
+   - Embedding target: “Objects (from masks)” or “Whole image (no SAM)”
+   - DINOv2 variant: `dinov2_vits14`, `vitb14`, `vitl14`, `vitg14`
+   - Embedding crop size (applies to objects and whole image)
+6. Click “Run segmentation”.
+7. Inspect:
    - Overlay (image + colorful masks)
    - Masks-only grid (optional)
    - Combined masks image
-7. Download a ZIP containing individual mask PNGs (and optionally overlay/combined images).
+8. Download a ZIP containing:
+   - Object PNGs (optional)
+   - `dinov2_embeddings.npy` (indices, features) and `dinov2_catalog.tsv` (if embeddings enabled)
+
+### 2) Embedding comparisons (two images)
+- Upload Image A and Image B in section “Embedding comparisons”.
+- Click “Compare two images (whole + objects)”. The app will:
+  - Compute whole-image DINOv2 embeddings for A and B and show cosine similarity/distance
+  - Run SAM2 on both images, embed all objects with DINOv2, compute A↔B cosine similarities, and list Top‑K object matches
+- Adjustable thresholds in UI:
+  - Whole dup threshold: cosine ≥ threshold → “Likely duplicate/copy”
+  - Whole similar threshold: cosine ≥ threshold → “Similar”, else “Dissimilar”
+  - Object match sim ≥: per‑object cosine to be counted as a match
+  - Object coverage ≥: fraction of A’s objects matched in B to consider objects “Similar”
 
 ---
 
@@ -113,6 +172,10 @@ Adjust CUDA version and commands based on your environment: see [PyTorch](https:
 .
 ├── app.py            # Streamlit app
 ├── requirements.txt  # Pinned dependencies
+├── COMMANDS.md       # Helpful setup & CLI usage
+├── read_dinov2_embeddings.py      # Read dinov2_embeddings from ZIP/NPY
+├── visualize_dinov2_embeddings.py # Make heatmap + PCA plots
+├── closest_dinov2_pair.py         # Find closest pairs/top-K by cosine
 └── README.md         # This file
 ```
 
