@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import torch
 from torchvision import transforms as T
 import zipfile
+import pandas as pd
 
 # ---- Compatibility shim for older Torch versions ----
 try:
@@ -25,6 +26,27 @@ try:
         def _is_compiling_false():
             return False
         torch.compiler.is_compiling = _is_compiling_false  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+# ---- AMP compatibility shim for some model hubs expecting torch.amp.custom_fwd/custom_bwd ----
+try:
+    import torch as _torch_mod
+    amp_mod = getattr(_torch_mod, "amp", None)
+    if amp_mod is not None:
+        # Provide no-op decorators if missing (common on older/newer Torch combos)
+        if not hasattr(amp_mod, "custom_fwd"):
+            def _no_op_decorator(fn=None, **kwargs):
+                def wrap(f):
+                    return f
+                return wrap(fn) if fn is not None else wrap
+            amp_mod.custom_fwd = _no_op_decorator  # type: ignore[attr-defined]
+        if not hasattr(amp_mod, "custom_bwd"):
+            def _no_op_decorator(fn=None, **kwargs):
+                def wrap(f):
+                    return f
+                return wrap(fn) if fn is not None else wrap
+            amp_mod.custom_bwd = _no_op_decorator  # type: ignore[attr-defined]
 except Exception:
     pass
 
@@ -45,14 +67,25 @@ def resize_and_pad_to_square(img: Image.Image, target_side: int = 1024) -> Image
     padded.paste(img_resized, offset)
     return padded
 
-# ---- DINOv2 helpers ----
+# ---- DINOv2 / DINOv3 helpers ----
 @st.cache_resource
 def load_dinov2_model(variant: str, use_cuda: bool):
     """Load a DINOv2 backbone via torch.hub and move to desired device.
     variant examples: 'dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'
     """
     device = torch.device("cuda:0") if use_cuda and hasattr(torch, "cuda") and torch.cuda.is_available() else torch.device("cpu")
-    model = torch.hub.load('facebookresearch/dinov2', variant)
+    # Allow loading from a local clone to avoid network restrictions
+    local_repo = os.getenv("DINOV2_LOCAL_REPO")
+    if local_repo and os.path.isdir(local_repo):
+        model = torch.hub.load(local_repo, variant, source='local')
+    else:
+        try:
+            model = torch.hub.load('facebookresearch/dinov2', variant)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load DINOv2 via torch.hub: {e}. "
+                "Option: clone the repo locally and set DINOV2_LOCAL_REPO=/path/to/dinov2"
+            )
     model.eval()
     model.to(device)
     return model, device
@@ -65,6 +98,97 @@ def preprocess_for_dinov2(pil_img: Image.Image, size: int = 224) -> torch.Tensor
     tensor = T.ToTensor()(img_sq)
     tensor = T.Normalize(mean=mean, std=std)(tensor)
     return tensor
+
+@st.cache_resource
+def load_dinov3_model(variant: str, use_cuda: bool):
+    """Load a DINOv3 backbone via torch.hub and move to desired device.
+    Suggested variants (hubconf names): 'dinov3_vits16', 'dinov3_vitb16', 'dinov3_vitl16'
+    """
+    device = torch.device("cuda:0") if use_cuda and hasattr(torch, "cuda") and torch.cuda.is_available() else torch.device("cpu")
+    # Allow loading from a local clone to avoid HTTP 403 or network restrictions
+    local_repo = os.getenv("DINOV3_LOCAL_REPO")
+    weights_path = os.getenv("DINOV3_WEIGHTS_PATH")
+    weights_dir = os.getenv("DINOV3_WEIGHTS_DIR")
+    weights_arg = None
+    # Resolve weights from env if provided
+    try:
+        if weights_path and os.path.isfile(weights_path):
+            weights_arg = weights_path
+        elif weights_dir and os.path.isdir(weights_dir):
+            # Try to find a weights file matching the variant
+            # Expected filename contains model arch like 'dinov3_vitb16_... .pth'
+            arch_key = variant.replace("dinov3_", "")
+            candidates = [
+                os.path.join(weights_dir, f)
+                for f in os.listdir(weights_dir)
+                if f.endswith('.pth') and arch_key in f
+            ]
+            if not candidates:
+                # fallback to any .pth in dir
+                candidates = [
+                    os.path.join(weights_dir, f)
+                    for f in os.listdir(weights_dir)
+                    if f.endswith('.pth')
+                ]
+            if candidates:
+                # pick the first deterministically (sorted)
+                candidates.sort()
+                weights_arg = candidates[0]
+    except Exception:
+        pass
+
+    # If a weights file is provided, infer the correct variant from its filename to avoid mismatches
+    inferred_variant = None
+    try:
+        fname = os.path.basename(weights_arg) if weights_arg else ""
+        name = fname.lower()
+        if name:
+            if "vitl16" in name:
+                inferred_variant = "dinov3_vitl16"
+            elif "vitb16" in name:
+                inferred_variant = "dinov3_vitb16"
+            elif "vits16" in name:
+                inferred_variant = "dinov3_vits16"
+    except Exception:
+        pass
+    effective_variant = inferred_variant or variant
+
+    if local_repo and os.path.isdir(local_repo):
+        # Load from local hub; pass weights if available to avoid network downloads
+        if weights_arg is not None:
+            model = torch.hub.load(local_repo, effective_variant, source='local', weights=weights_arg, pretrained=True)
+        else:
+            model = torch.hub.load(local_repo, effective_variant, source='local')
+    else:
+        try:
+            if weights_arg is not None:
+                model = torch.hub.load('facebookresearch/dinov3', effective_variant, weights=weights_arg, pretrained=True)
+            else:
+                model = torch.hub.load('facebookresearch/dinov3', effective_variant)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load DINOv3 via torch.hub: {e}. "
+                "Fix: git clone https://github.com/facebookresearch/dinov3.git and set DINOV3_LOCAL_REPO, "
+                "and/or download weights locally then set DINOV3_WEIGHTS_PATH or DINOV3_WEIGHTS_DIR."
+            )
+    model.eval()
+    model.to(device)
+    return model, device
+
+def preprocess_for_dinov3(pil_img: Image.Image, size: int = 224) -> torch.Tensor:
+    """DINOv3 uses ImageNet normalization like DINOv2; reuse same preprocessing."""
+    return preprocess_for_dinov2(pil_img, size)
+
+def load_embedding_model(family: str, variant: str, use_cuda: bool):
+    """Unified loader for embedding backbones."""
+    if family == "DINOv3":
+        return load_dinov3_model(variant, use_cuda)
+    # Default to DINOv2
+    return load_dinov2_model(variant, use_cuda)
+
+def preprocess_for_embedding(family: str):
+    """Return appropriate preprocessing function for the selected family."""
+    return preprocess_for_dinov3 if family == "DINOv3" else preprocess_for_dinov2
 
 def load_embeddings_from_filelike(file_like) -> Dict[str, np.ndarray]:
     """Read embeddings from an uploaded .npy or .zip file.
@@ -115,7 +239,7 @@ def run_sam_generate_masks(input_image: Image.Image, pipe, params: Dict[str, Any
         outputs = pipe(safe_image, num_workers=0, batch_size=1, **core_params)
     return outputs
 
-def embed_object_crops(input_image: Image.Image, mask_list: list, dinov2_model, dinov2_device, crop_size: int) -> Tuple[np.ndarray, np.ndarray]:
+def embed_object_crops(input_image: Image.Image, mask_list: list, model, device, crop_size: int, preprocess_fn) -> Tuple[np.ndarray, np.ndarray]:
     """Return (indices [N], features [N,D]) for object crops defined by masks."""
     feats: list = []
     idxs: list = []
@@ -126,9 +250,9 @@ def embed_object_crops(input_image: Image.Image, mask_list: list, dinov2_model, 
         top, left = int(ys.min()), int(xs.min())
         bottom, right = int(ys.max()) + 1, int(xs.max()) + 1
         rgb_crop = input_image.crop((left, top, right, bottom)).convert("RGB")
-        tensor = preprocess_for_dinov2(rgb_crop, size=int(crop_size)).unsqueeze(0).to(dinov2_device)
+        tensor = preprocess_fn(rgb_crop, size=int(crop_size)).unsqueeze(0).to(device)
         with torch.no_grad():
-            f = dinov2_model(tensor)
+            f = model(tensor)
         if isinstance(f, dict):
             f = f.get('x', next((v for v in f.values() if isinstance(v, torch.Tensor)), None))
         if isinstance(f, torch.Tensor):
@@ -369,11 +493,11 @@ include_object_crops = st.sidebar.checkbox("Include object images (transparent B
 object_tight_crop = st.sidebar.checkbox("Tight crop object images to bounding box", value=True)
 include_masks_in_zip = st.sidebar.checkbox("Include mask PNGs in ZIP", value=False)
 
-# Embeddings (DINOv2)
+# Embeddings (DINOv2 / DINOv3)
 st.sidebar.header("Embeddings")
 # Session state for the crops embedding toggle
-if "embed_with_dinov2" not in st.session_state:
-    st.session_state.embed_with_dinov2 = False
+if "embed_enabled" not in st.session_state:
+    st.session_state.embed_enabled = False
 
 # Target first so we can disable crop-embedding toggle when needed
 embedding_target = st.sidebar.selectbox(
@@ -385,31 +509,57 @@ embedding_target = st.sidebar.selectbox(
 
 # If whole-image is selected, force-disable crop embeddings
 disable_embed_crops = (embedding_target == "Whole image (no SAM)")
-if disable_embed_crops and st.session_state.embed_with_dinov2:
-    st.session_state.embed_with_dinov2 = False
+if disable_embed_crops and st.session_state.embed_enabled:
+    st.session_state.embed_enabled = False
 
 # Toggle for object-crop embeddings, disabled in whole-image mode
 st.sidebar.checkbox(
-    "Compute DINOv2 embeddings for object crops",
-    key="embed_with_dinov2",
+    "Compute embeddings for object crops",
+    key="embed_enabled",
     disabled=disable_embed_crops,
     help=("Disabled in whole-image mode." if disable_embed_crops else "Compute embeddings for each detected object crop.")
 )
-embed_with_dinov2 = bool(st.session_state.embed_with_dinov2)
+embed_enabled = bool(st.session_state.embed_enabled)
 
-dinov2_variant = st.sidebar.selectbox(
-    "DINOv2 variant",
-    options=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"],
-    index=1,
-    help="Backbone size. Larger models yield stronger embeddings but are slower."
+embedding_family = st.sidebar.selectbox(
+    "Embedding model",
+    options=["DINOv2", "DINOv3"],
+    index=0,
+    help="Choose which model family to use for embeddings."
 )
-dinov2_crop_size = st.sidebar.slider(
+if embedding_family == "DINOv2":
+    embedding_variant = st.sidebar.selectbox(
+        "DINOv2 variant",
+        options=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"],
+        index=1,
+        help="Backbone size. Larger models yield stronger embeddings but are slower."
+    )
+else:
+    embedding_variant = st.sidebar.selectbox(
+        "DINOv3 variant",
+        options=["dinov3_vits16", "dinov3_vitb16", "dinov3_vitl16"],
+        index=1,
+        help="Backbone size. Larger models yield stronger embeddings but are slower."
+    )
+    # Optional local weights to avoid network downloads (403)
+    dinov3_weights_path_input = st.sidebar.text_input(
+        "DINOv3 weights .pth path (optional)",
+        value=os.getenv("DINOV3_WEIGHTS_PATH", ""),
+        help="Path to a local .pth checkpoint to load (avoids network)."
+    )
+    dinov3_weights_dir_input = st.sidebar.text_input(
+        "DINOv3 weights directory (optional)",
+        value=os.getenv("DINOV3_WEIGHTS_DIR", ""),
+        help="Directory containing .pth checkpoints; the app will pick a matching file."
+    )
+
+embedding_crop_size = st.sidebar.slider(
     "Embedding crop size (px)",
     min_value=128,
     max_value=392,
     value=224,
     step=32,
-    help="Resize+letterbox to this square size before DINOv2. Applies to objects and whole image."
+    help="Resize+letterbox to this square size before embedding. Applies to objects and whole image."
 )
 
 # Upload image
@@ -431,23 +581,34 @@ if uploaded is not None:
 
 # Run button
 if st.button("Run segmentation"):
+    # Persist optional weights envs at runtime so loader can read them
+    if embedding_family == "DINOv3":
+        try:
+            if 'dinov3_weights_path_input' in locals() and dinov3_weights_path_input:
+                os.environ["DINOV3_WEIGHTS_PATH"] = dinov3_weights_path_input
+            if 'dinov3_weights_dir_input' in locals() and dinov3_weights_dir_input:
+                os.environ["DINOV3_WEIGHTS_DIR"] = dinov3_weights_dir_input
+        except Exception:
+            pass
+
     # Whole-image embedding path (skip SAM) if selected
-    if embed_with_dinov2 and embedding_target == "Whole image (no SAM)":
+    if embed_enabled and embedding_target == "Whole image (no SAM)":
         if uploaded is None or image is None:
             st.error("Please upload an image to compute the whole-image embedding.")
             st.stop()
-        st.info("Computing DINOv2 embedding for the whole image (no SAM masks)...")
+        st.info(f"Computing {embedding_family} embedding for the whole image (no SAM masks)...")
         try:
-            with st.spinner("Loading DINOv2 model…"):
-                dinov2_model, dinov2_device = load_dinov2_model(dinov2_variant, use_cuda=(device_selected == 0))
+            with st.spinner(f"Loading {embedding_family} model…"):
+                embed_model, embed_device = load_embedding_model(embedding_family, embedding_variant, use_cuda=(device_selected == 0))
             with st.spinner("Embedding whole image…"):
-                tensor = preprocess_for_dinov2(image, size=int(dinov2_crop_size)).unsqueeze(0).to(dinov2_device)
+                preprocess_fn = preprocess_for_embedding(embedding_family)
+                tensor = preprocess_fn(image, size=int(embedding_crop_size)).unsqueeze(0).to(embed_device)
                 with torch.no_grad():
-                    feats = dinov2_model(tensor)
+                    feats = embed_model(tensor)
                 if isinstance(feats, dict):
                     feats = feats.get('x', next((v for v in feats.values() if isinstance(v, torch.Tensor)), None))
                 if not isinstance(feats, torch.Tensor):
-                    raise RuntimeError("Unexpected DINOv2 output type")
+                    raise RuntimeError("Unexpected embedding model output type")
                 vec = feats.squeeze(0).detach().cpu().float().numpy()
 
             files_dict = {}
@@ -458,29 +619,30 @@ if st.button("Run segmentation"):
             # Save per-item vector
             bnp = io.BytesIO()
             np.save(bnp, vec)
-            files_dict["whole_image_dinov2.npy"] = bnp.getvalue()
+            prefix = "dinov3" if embedding_family == "DINOv3" else "dinov2"
+            files_dict[f"whole_image_{prefix}.npy"] = bnp.getvalue()
             # Save catalog and stacked file (single row)
             header = ["index", "variant", "crop_h", "crop_w", "feat_dim"]
             lines = ["\t".join(header)]
             lines.append("\t".join([
                 "0",
-                dinov2_variant,
+                embedding_variant,
                 str(image.size[1]),
                 str(image.size[0]),
                 str(int(vec.shape[0]))
             ]))
-            files_dict["dinov2_catalog.tsv"] = ("\n".join(lines)).encode("utf-8")
+            files_dict[f"{prefix}_catalog.tsv"] = ("\n".join(lines)).encode("utf-8")
 
             stacked = {"indices": np.array([0], dtype=np.int32), "features": np.expand_dims(vec, axis=0)}
             bstack = io.BytesIO()
             np.save(bstack, stacked)
-            files_dict["dinov2_embeddings.npy"] = bstack.getvalue()
+            files_dict[f"{prefix}_embeddings.npy"] = bstack.getvalue()
 
             zip_bytes = make_zip_bytes(files_dict)
             st.download_button(
                 "Download whole-image embedding (ZIP)",
                 data=zip_bytes,
-                file_name="dinov2_whole_image.zip",
+                file_name=f"{prefix}_whole_image.zip",
                 mime="application/zip"
             )
             st.success(f"Whole-image embedding computed. Feature dim: {vec.shape[0]}")
@@ -559,13 +721,14 @@ if st.button("Run segmentation"):
     # Prepare ZIP for download
     st.subheader("Download masks and objects")
     files_dict = {}  # filename -> bytes
-    dinov2_embeddings = []  # list of (idx, vector np.ndarray)
-    dinov2_meta = []  # list of dicts with metadata
-    dinov2_model = None
-    dinov2_device = None
-    if embed_with_dinov2 and len(masks_bool) > 0:
-        with st.spinner("Loading DINOv2 model for embeddings…"):
-            dinov2_model, dinov2_device = load_dinov2_model(dinov2_variant, use_cuda=(device_selected == 0))
+    embed_vectors = []  # list of (idx, vector np.ndarray)
+    embed_meta = []  # list of dicts with metadata
+    embed_model = None
+    embed_device = None
+    prefix = "dinov3" if embedding_family == "DINOv3" else "dinov2"
+    if embed_enabled and len(masks_bool) > 0:
+        with st.spinner(f"Loading {embedding_family} model for embeddings…"):
+            embed_model, embed_device = load_embedding_model(embedding_family, embedding_variant, use_cuda=(device_selected == 0))
     for i, mask in enumerate(masks_bool):
         # optionally save mask png
         if include_masks_in_zip:
@@ -585,8 +748,8 @@ if st.button("Run segmentation"):
                 # Skip this object if something goes wrong; continue others
                 pass
 
-        # optionally compute DINOv2 embedding on tight bounding crop from original RGB
-        if embed_with_dinov2 and dinov2_model is not None:
+        # optionally compute embedding on tight bounding crop from original RGB
+        if embed_enabled and embed_model is not None:
             try:
                 ys, xs = np.where(mask)
                 if ys.size == 0 or xs.size == 0:
@@ -594,9 +757,10 @@ if st.button("Run segmentation"):
                 top, left = int(ys.min()), int(xs.min())
                 bottom, right = int(ys.max()) + 1, int(xs.max()) + 1
                 rgb_crop = image.crop((left, top, right, bottom)).convert("RGB")
-                tensor = preprocess_for_dinov2(rgb_crop, size=int(dinov2_crop_size)).unsqueeze(0).to(dinov2_device)
+                preprocess_fn = preprocess_for_embedding(embedding_family)
+                tensor = preprocess_fn(rgb_crop, size=int(embedding_crop_size)).unsqueeze(0).to(embed_device)
                 with torch.no_grad():
-                    feats = dinov2_model(tensor)
+                    feats = embed_model(tensor)
                 # Some hubs may return dict; handle both
                 if isinstance(feats, dict):
                     if 'x' in feats:
@@ -606,10 +770,10 @@ if st.button("Run segmentation"):
                         feats = next((v for v in feats.values() if isinstance(v, torch.Tensor)), None)
                 if isinstance(feats, torch.Tensor):
                     vec = feats.squeeze(0).detach().cpu().float().numpy()
-                    dinov2_embeddings.append((i, vec))
-                    dinov2_meta.append({
+                    embed_vectors.append((i, vec))
+                    embed_meta.append({
                         "index": i,
-                        "variant": dinov2_variant,
+                        "variant": embedding_variant,
                         "crop_h": rgb_crop.size[1],
                         "crop_w": rgb_crop.size[0],
                         "feat_dim": int(vec.shape[0])
@@ -617,7 +781,7 @@ if st.button("Run segmentation"):
                     # save per-object npy
                     bnp = io.BytesIO()
                     np.save(bnp, vec)
-                    files_dict[f"object_{i}_dinov2.npy"] = bnp.getvalue()
+                    files_dict[f"object_{i}_{prefix}.npy"] = bnp.getvalue()
             except Exception as e:
                 # continue on errors per object
                 pass
@@ -633,20 +797,20 @@ if st.button("Run segmentation"):
         files_dict["combined_masks.png"] = b.getvalue()
 
     # If we computed any embeddings, save also a catalog TSV and a stacked matrix
-    if embed_with_dinov2 and len(dinov2_embeddings) > 0:
+    if embed_enabled and len(embed_vectors) > 0:
         try:
             # TSV
             header = ["index", "variant", "crop_h", "crop_w", "feat_dim"]
             lines = ["\t".join(header)]
-            for row in dinov2_meta:
+            for row in embed_meta:
                 lines.append("\t".join(str(row[k]) for k in header))
-            files_dict["dinov2_catalog.tsv"] = ("\n".join(lines)).encode("utf-8")
+            files_dict[f"{prefix}_catalog.tsv"] = ("\n".join(lines)).encode("utf-8")
             # Stacked features
-            indices = [idx for idx, _ in dinov2_embeddings]
-            mat = np.stack([vec for _, vec in dinov2_embeddings], axis=0)
+            indices = [idx for idx, _ in embed_vectors]
+            mat = np.stack([vec for _, vec in embed_vectors], axis=0)
             bnp = io.BytesIO()
             np.save(bnp, {"indices": np.array(indices, dtype=np.int32), "features": mat})
-            files_dict["dinov2_embeddings.npy"] = bnp.getvalue()
+            files_dict[f"{prefix}_embeddings.npy"] = bnp.getvalue()
         except Exception:
             pass
 
@@ -677,18 +841,43 @@ with col_t3:
 with col_t4:
     obj_cover_thresh = st.number_input("Object coverage ≥", min_value=0.0, max_value=1.0, value=0.50, step=0.05, help="fraction of A's objects with a match in B to claim similarity")
 
+# Clear results and inputs
+clear_cols = st.columns(3)
+with clear_cols[0]:
+    if st.button("Clear results"):
+        try:
+            # Clear comparison data and selections
+            if "cmp_data" in st.session_state:
+                del st.session_state["cmp_data"]
+            if "cmp_selected" in st.session_state:
+                del st.session_state["cmp_selected"]
+            # Clear any per-row view checkboxes
+            keys_to_delete = [k for k in st.session_state.keys() if str(k).startswith("cmp_view_")]
+            for k in keys_to_delete:
+                try:
+                    del st.session_state[k]
+                except Exception:
+                    pass
+            # Clear uploaders
+            st.session_state["pair_imgA"] = None
+            st.session_state["pair_imgB"] = None
+        except Exception:
+            pass
+        st.rerun()
+
 if imgA is not None and imgB is not None and st.button("Compare two images (whole + objects)"):
     try:
-        with st.spinner("Loading DINOv2 and SAM2…"):
-            dinov2_model, dinov2_device = load_dinov2_model(dinov2_variant, use_cuda=(device_selected == 0))
+        with st.spinner(f"Loading {embedding_family} and SAM2…"):
+            embed_model, embed_device = load_embedding_model(embedding_family, embedding_variant, use_cuda=(device_selected == 0))
         imA = Image.open(imgA).convert("RGB")
         imB = Image.open(imgB).convert("RGB")
         # Whole-image embeddings
-        tA = preprocess_for_dinov2(imA, size=int(dinov2_crop_size)).unsqueeze(0).to(dinov2_device)
-        tB = preprocess_for_dinov2(imB, size=int(dinov2_crop_size)).unsqueeze(0).to(dinov2_device)
+        preprocess_fn = preprocess_for_embedding(embedding_family)
+        tA = preprocess_fn(imA, size=int(embedding_crop_size)).unsqueeze(0).to(embed_device)
+        tB = preprocess_fn(imB, size=int(embedding_crop_size)).unsqueeze(0).to(embed_device)
         with torch.no_grad():
-            fA = dinov2_model(tA)
-            fB = dinov2_model(tB)
+            fA = embed_model(tA)
+            fB = embed_model(tB)
         if isinstance(fA, dict):
             fA = fA.get('x', next((v for v in fA.values() if isinstance(v, torch.Tensor)), None))
         if isinstance(fB, dict):
@@ -725,8 +914,8 @@ if imgA is not None and imgB is not None and st.button("Compare two images (whol
         masksA = masks_to_numpy_list(outA.get("masks", []))
         masksB = masks_to_numpy_list(outB.get("masks", []))
         with st.spinner("Embedding object crops…"):
-            idxA, featsA = embed_object_crops(imA, masksA, dinov2_model, dinov2_device, int(dinov2_crop_size))
-            idxB, featsB = embed_object_crops(imB, masksB, dinov2_model, dinov2_device, int(dinov2_crop_size))
+            idxA, featsA = embed_object_crops(imA, masksA, embed_model, embed_device, int(embedding_crop_size), preprocess_fn)
+            idxB, featsB = embed_object_crops(imB, masksB, embed_model, embed_device, int(embedding_crop_size), preprocess_fn)
         if featsA.size == 0 or featsB.size == 0:
             st.warning("One of the images has no object embeddings; cannot compute object-to-object similarities.")
         else:
@@ -751,8 +940,18 @@ if imgA is not None and imgB is not None and st.button("Compare two images (whol
                 })
             # Sort rows by similarity desc and show top-K in order
             rows.sort(key=lambda r: r["cos_sim"], reverse=True)
-            st.subheader("Top object similarities (A vs B)")
-            st.dataframe(rows, use_container_width=True)
+            # Persist comparison data to session for interactive viewing without recompute
+            st.session_state.cmp_data = {
+                "imA_np": np.array(imA),
+                "imB_np": np.array(imB),
+                "masksA": masksA,
+                "masksB": masksB,
+                "idxA": idxA,
+                "idxB": idxB,
+                "rows": rows,
+                "simAB": simAB.astype(np.float32),
+                "whole_sim": whole_sim,
+            }
 
             # Coverage metric: fraction of A's objects that have at least one B match ≥ obj_sim_thresh
             best_per_A = simAB.max(axis=1)
@@ -764,3 +963,51 @@ if imgA is not None and imgB is not None and st.button("Compare two images (whol
                 st.info("Object judgment: Not similar enough (coverage < threshold)")
     except Exception as e:
         st.error(f"Image-to-image comparison failed: {e}")
+
+# Interactive viewing of previously computed matches without recomputation
+if "cmp_data" in st.session_state:
+    try:
+        cd = st.session_state.cmp_data
+        imA = Image.fromarray(cd["imA_np"])  # reconstruct PIL
+        imB = Image.fromarray(cd["imB_np"])
+        masksA = cd["masksA"]
+        masksB = cd["masksB"]
+        rows = list(cd["rows"])  # list of dicts
+        # Sort rows and build DataFrame
+        rows.sort(key=lambda r: r["cos_sim"], reverse=True)
+        st.subheader("Top object similarities (A vs B)")
+        df_rows = pd.DataFrame(rows)
+        st.dataframe(df_rows, hide_index=True, use_container_width=True)
+        # Maintain selection state across reruns using per-row checkboxes (no double-click)
+        if "cmp_selected" not in st.session_state:
+            st.session_state.cmp_selected = set()
+        st.caption("Select matches to view")
+        new_sel = set()
+        for r in rows:
+            a = int(r["A_index"])
+            b = int(r["B_index"])
+            key = f"cmp_view_{a}_{b}"
+            default_checked = key in st.session_state and bool(st.session_state.get(key))
+            label = f"A {a} ↔ B {b} (cos={float(r['cos_sim']):.3f})"
+            checked = st.checkbox(label, value=default_checked, key=key)
+            if checked:
+                new_sel.add(f"{a}_{b}")
+        st.session_state.cmp_selected = new_sel
+        # Render selected crops
+        for key in sorted(st.session_state.cmp_selected):
+            a_idx_str, b_idx_str = key.split("_")
+            a_idx = int(a_idx_str)
+            b_idx = int(b_idx_str)
+            c1, c2 = st.columns(2)
+            try:
+                cropA = create_object_cutout_rgba(imA, masksA[a_idx], tight_crop=True)
+                c1.image(cropA, caption=f"A object_{a_idx}", width="content")
+            except Exception:
+                c1.write(f"Could not render A object_{a_idx}")
+            try:
+                cropB = create_object_cutout_rgba(imB, masksB[b_idx], tight_crop=True)
+                c2.image(cropB, caption=f"B object_{b_idx}", width="content")
+            except Exception:
+                c2.write(f"Could not render B object_{b_idx}")
+    except Exception:
+        pass

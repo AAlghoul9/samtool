@@ -10,26 +10,38 @@ import numpy as np
 
 
 def load_embeddings_from_zip(zip_path: str) -> Tuple[np.ndarray, np.ndarray, Optional[List[Dict[str, str]]]]:
-    """Load indices and features from a sam2_results.zip produced by the app.
+    """Load indices and features from a results ZIP produced by the app.
+
+    Auto-detects DINOv2 vs DINOv3 by file names:
+      - *_embeddings.npy (dict with indices, features)
+      - *_catalog.tsv (optional)
 
     Returns (indices, features, catalog_rows) where:
       - indices: shape (N,), dtype int32
       - features: shape (N, D), dtype float32
-      - catalog_rows: list of dicts parsed from dinov2_catalog.tsv or None if missing
+      - catalog_rows: list of dicts parsed from catalog tsv or None if missing
     """
     if not os.path.isfile(zip_path):
         raise FileNotFoundError(f"ZIP not found: {zip_path}")
     with zipfile.ZipFile(zip_path, "r") as zf:
-        if "dinov2_embeddings.npy" not in zf.namelist():
-            raise FileNotFoundError("dinov2_embeddings.npy not found in ZIP")
-        with zf.open("dinov2_embeddings.npy") as f:
+        names = zf.namelist()
+        emb_name = None
+        # prefer dinov3 if present, else dinov2
+        if "dinov3_embeddings.npy" in names:
+            emb_name = "dinov3_embeddings.npy"
+        elif "dinov2_embeddings.npy" in names:
+            emb_name = "dinov2_embeddings.npy"
+        else:
+            raise FileNotFoundError("No *_embeddings.npy found in ZIP (expected dinov2_embeddings.npy or dinov3_embeddings.npy)")
+        with zf.open(emb_name) as f:
             data = np.load(io.BytesIO(f.read()), allow_pickle=True).item()
         indices = np.asarray(data.get("indices"))
         features = np.asarray(data.get("features"))
 
         catalog_rows: Optional[List[Dict[str, str]]] = None
-        if "dinov2_catalog.tsv" in zf.namelist():
-            with zf.open("dinov2_catalog.tsv") as f:
+        cat_name = "dinov3_catalog.tsv" if "dinov3_catalog.tsv" in names else ("dinov2_catalog.tsv" if "dinov2_catalog.tsv" in names else None)
+        if cat_name is not None:
+            with zf.open(cat_name) as f:
                 tsv_text = f.read().decode("utf-8", errors="replace")
             lines = [ln for ln in tsv_text.splitlines() if ln.strip()]
             if lines:
@@ -58,12 +70,19 @@ def load_embeddings_from_npy(npy_path: str) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def read_single_object_vector_from_zip(zip_path: str, object_index: int) -> np.ndarray:
-    """Read a single per-object vector (object_{i}_dinov2.npy) from the ZIP if present."""
-    filename = f"object_{object_index}_dinov2.npy"
+    """Read a single per-object vector (object_{i}_dinov2.npy or object_{i}_dinov3.npy) from the ZIP if present."""
     with zipfile.ZipFile(zip_path, "r") as zf:
-        if filename not in zf.namelist():
-            raise FileNotFoundError(f"{filename} not found in ZIP")
-        with zf.open(filename) as f:
+        names = zf.namelist()
+        # prefer dinov3 if present for that index
+        fname3 = f"object_{object_index}_dinov3.npy"
+        fname2 = f"object_{object_index}_dinov2.npy"
+        if fname3 in names:
+            sel = fname3
+        elif fname2 in names:
+            sel = fname2
+        else:
+            raise FileNotFoundError(f"object_{object_index}_dinov2.npy or object_{object_index}_dinov3.npy not found in ZIP")
+        with zf.open(sel) as f:
             vec = np.load(io.BytesIO(f.read()))
     return np.asarray(vec)
 
